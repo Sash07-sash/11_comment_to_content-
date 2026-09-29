@@ -1,7 +1,9 @@
 import json
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List
+
 from sqlalchemy.orm import Session
+from langchain_core.runnables import RunnableLambda
 
 from backend.app.db import SessionLocal
 from backend.app.models import (
@@ -14,6 +16,7 @@ from backend.app.pipeline.score import compute_cluster_scores
 from backend.app.pipeline.ideas import generate_ideas_for_clusters
 from backend.app.pipeline.gap import perform_gap_analysis
 from backend.app.pipeline.replies import draft_replies_for_ideas
+from backend.app.pipeline.agents import run_critique, run_scriptwriter, run_visuals
 
 logger = logging.getLogger(__name__)
 
@@ -43,20 +46,17 @@ def update_job_status(
     finally:
         db.close()
 
+# --- LangChain LCEL Nodes ---
 
-def run_pipeline_for_job(job_id: str):
-    """
-    Executes the full 7-step ComIdea Instagram comment-to-content pipeline.
-    """
-    logger.info(f"Starting Instagram-first ComIdea pipeline for job: {job_id}")
+def load_data_step(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    job_id = state["job_id"]
     db: Session = SessionLocal()
-
     try:
-        # Load raw comments for this job
         db_raw_comments = db.query(RawComment).filter(RawComment.job_id == job_id).all()
         if not db_raw_comments:
-            update_job_status(job_id, "failed", 0, "No comments found", error_message="No comments available for processing.")
-            return
+            state["error"] = "No comments available for processing."
+            return state
 
         raw_comments_data = [
             {
@@ -75,12 +75,23 @@ def run_pipeline_for_job(job_id: str):
             }
             for c in db_raw_comments
         ]
+        state["raw_comments_data"] = raw_comments_data
+    finally:
+        db.close()
+    return state
 
-        # STEP 1: Cleaning & Normalization + Mention Detection
-        update_job_status(job_id, "processing", 15, "Filtering spam & analyzing Instagram share mentions")
-        cleaned_comments, removed_comments = clean_comments(raw_comments_data)
-
+def clean_step(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    job_id = state["job_id"]
+    update_job_status(job_id, "processing", 15, "Filtering spam & analyzing Instagram share mentions")
+    
+    cleaned_comments, removed_comments = clean_comments(state["raw_comments_data"])
+    
+    db: Session = SessionLocal()
+    try:
+        db_raw_comments = db.query(RawComment).filter(RawComment.job_id == job_id).all()
         comment_id_map = {c.comment_id: c for c in db_raw_comments}
+        
         for item in cleaned_comments:
             c = comment_id_map.get(item["comment_id"])
             if c:
@@ -99,17 +110,27 @@ def run_pipeline_for_job(job_id: str):
                 c.removal_reason = item["removal_reason"]
                 c.has_share_mention = item.get("has_share_mention", False)
                 c.mentions_count = item.get("mentions_count", 0)
-
         db.commit()
+    finally:
+        db.close()
 
-        if not cleaned_comments:
-            update_job_status(job_id, "failed", 20, "All comments filtered", error_message="All comments were identified as spam or too short.")
-            return
+    if not cleaned_comments:
+        state["error"] = "All comments were identified as spam or too short."
+        return state
 
-        # STEP 2: Intent Classification (Request patterns & Emojis)
-        update_job_status(job_id, "processing", 35, "Classifying audience intents with Instagram signals")
-        classified_comments = classify_intents(cleaned_comments)
+    state["cleaned_comments"] = cleaned_comments
+    state["removed_comments"] = removed_comments
+    return state
 
+def classify_step(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    job_id = state["job_id"]
+    update_job_status(job_id, "processing", 35, "Classifying audience intents with Instagram signals")
+    
+    classified_comments = classify_intents(state["cleaned_comments"])
+    
+    db: Session = SessionLocal()
+    try:
         db.query(CommentIntent).filter(CommentIntent.job_id == job_id).delete()
         for c in classified_comments:
             intent_obj = CommentIntent(
@@ -121,15 +142,30 @@ def run_pipeline_for_job(job_id: str):
             )
             db.add(intent_obj)
         db.commit()
+    finally:
+        db.close()
+        
+    state["classified_comments"] = classified_comments
+    return state
 
-        # STEP 3: Multilingual Clustering & Theme Naming
-        update_job_status(job_id, "processing", 55, "Clustering themes & generating theme labels")
-        cluster_summaries, _ = cluster_and_name_comments(classified_comments)
+def cluster_step(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    job_id = state["job_id"]
+    update_job_status(job_id, "processing", 55, "Clustering themes & generating theme labels")
+    
+    cluster_summaries, _ = cluster_and_name_comments(state["classified_comments"])
+    state["cluster_summaries"] = cluster_summaries
+    return state
 
-        # STEP 4: Demand Scoring (Likes, Replies, Mentions, Recency)
-        update_job_status(job_id, "processing", 70, "Computing Instagram engagement & demand scores")
-        scored_clusters = compute_cluster_scores(cluster_summaries)
-
+def score_step(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    job_id = state["job_id"]
+    update_job_status(job_id, "processing", 70, "Computing Instagram engagement & demand scores")
+    
+    scored_clusters = compute_cluster_scores(state["cluster_summaries"])
+    
+    db: Session = SessionLocal()
+    try:
         db.query(Cluster).filter(Cluster.job_id == job_id).delete()
         for cs in scored_clusters:
             cluster_model = Cluster(
@@ -147,16 +183,54 @@ def run_pipeline_for_job(job_id: str):
             )
             db.add(cluster_model)
         db.commit()
+    finally:
+        db.close()
+        
+    state["scored_clusters"] = scored_clusters
+    return state
 
-        # STEP 5: Instagram-Native Idea Generation
-        update_job_status(job_id, "processing", 82, "Generating Instagram Reels, Carousels & Stories")
-        generated_ideas = generate_ideas_for_clusters(scored_clusters)
+def generate_ideas_step(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    job_id = state["job_id"]
+    update_job_status(job_id, "processing", 82, "Generating Instagram Reels, Carousels & Stories")
+    
+    generated_ideas = generate_ideas_for_clusters(state["scored_clusters"])
+    state["generated_ideas"] = generated_ideas
+    return state
 
-        # STEP 6: Content Gap Analysis vs Past Captions
-        update_job_status(job_id, "processing", 90, "Evaluating past post content gap")
-        analyzed_ideas = perform_gap_analysis(generated_ideas, raw_comments_data)
+def critique_step(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    job_id = state["job_id"]
+    update_job_status(job_id, "processing", 85, "Critiquing and refining generated ideas")
+    
+    state["generated_ideas"] = run_critique(state["generated_ideas"])
+    return state
 
-        # Persist Ideas
+def scriptwriter_step(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    job_id = state["job_id"]
+    update_job_status(job_id, "processing", 87, "Drafting teleprompter scripts")
+    
+    state["generated_ideas"] = run_scriptwriter(state["generated_ideas"])
+    return state
+
+def visuals_step(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    job_id = state["job_id"]
+    update_job_status(job_id, "processing", 88, "Prompting DALL-E/Midjourney visuals")
+    
+    state["generated_ideas"] = run_visuals(state["generated_ideas"])
+    return state
+
+def gap_analysis_step(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    job_id = state["job_id"]
+    update_job_status(job_id, "processing", 90, "Evaluating past post content gap")
+    
+    analyzed_ideas = perform_gap_analysis(state["generated_ideas"], state["raw_comments_data"])
+    
+    db: Session = SessionLocal()
+    try:
         db.query(Idea).filter(Idea.job_id == job_id).delete()
         for idea_item in analyzed_ideas:
             idea_model = Idea(
@@ -179,17 +253,31 @@ def run_pipeline_for_job(job_id: str):
                 story_validation_json=json.dumps(idea_item.get("story_validation") or {}),
                 hashtags_json=json.dumps(idea_item.get("hashtags") or []),
                 story_mention_caption=idea_item.get("story_mention_caption"),
+                script_draft=idea_item.get("script_draft"),
+                thumbnail_prompt=idea_item.get("thumbnail_prompt"),
+                critique_feedback=idea_item.get("critique_feedback"),
+                is_refined=idea_item.get("is_refined", False),
                 supporting_comment_ids_json=json.dumps(idea_item.get("supporting_comment_ids", []))
             )
             db.add(idea_model)
         db.commit()
+    finally:
+        db.close()
+        
+    state["analyzed_ideas"] = analyzed_ideas
+    return state
 
-        # STEP 7: Reply Drafts & Story Shoutouts
-        update_job_status(job_id, "processing", 96, "Drafting 'You asked, I made it' creator replies")
-        comments_by_id = {c["comment_id"]: c for c in classified_comments}
-        reply_drafts = draft_replies_for_ideas(analyzed_ideas, comments_by_id)
-
-        db.query(ReplyDraft).filter(ReplyDraft.idea_id.in_([i["id"] for i in analyzed_ideas])).delete(synchronize_session=False)
+def draft_replies_step(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("error"): return state
+    job_id = state["job_id"]
+    update_job_status(job_id, "processing", 96, "Drafting 'You asked, I made it' creator replies")
+    
+    comments_by_id = {c["comment_id"]: c for c in state["classified_comments"]}
+    reply_drafts = draft_replies_for_ideas(state["analyzed_ideas"], comments_by_id)
+    
+    db: Session = SessionLocal()
+    try:
+        db.query(ReplyDraft).filter(ReplyDraft.idea_id.in_([i["id"] for i in state["analyzed_ideas"]])).delete(synchronize_session=False)
         for rep in reply_drafts:
             reply_model = ReplyDraft(
                 id=rep["id"],
@@ -200,24 +288,78 @@ def run_pipeline_for_job(job_id: str):
             )
             db.add(reply_model)
         db.commit()
+    finally:
+        db.close()
+        
+    state["reply_drafts"] = reply_drafts
+    
+    # Calculate stats
+    stats = {
+        "total_raw": len(state["raw_comments_data"]),
+        "total_cleaned": len(state["cleaned_comments"]),
+        "spam_filtered": len(state["removed_comments"]),
+        "clusters_count": len(state["scored_clusters"]),
+        "ideas_count": len(state["analyzed_ideas"]),
+        "replies_count": len(state["reply_drafts"]),
+        "new_opportunities": sum(1 for i in state["analyzed_ideas"] if i.get("gap_status") == "new_opportunity"),
+        "already_covered": sum(1 for i in state["analyzed_ideas"] if i.get("gap_status") == "already_covered")
+    }
+    state["stats"] = stats
+    return state
 
-        # FINAL METRICS
-        stats = {
-            "total_raw": len(raw_comments_data),
-            "total_cleaned": len(cleaned_comments),
-            "spam_filtered": len(removed_comments),
-            "clusters_count": len(scored_clusters),
-            "ideas_count": len(analyzed_ideas),
-            "replies_count": len(reply_drafts),
-            "new_opportunities": sum(1 for i in analyzed_ideas if i.get("gap_status") == "new_opportunity"),
-            "already_covered": sum(1 for i in analyzed_ideas if i.get("gap_status") == "already_covered")
-        }
 
-        update_job_status(job_id, "completed", 100, "Pipeline completed successfully", stats=stats)
-        logger.info(f"ComIdea pipeline completed for job {job_id} with {len(analyzed_ideas)} Instagram-native ideas.")
-
+def run_pipeline_for_job(job_id: str):
+    """
+    Executes the full ComIdea Instagram comment-to-content pipeline
+    using LangChain LCEL RunnableSequence for orchestration.
+    """
+    logger.info(f"Starting LangChain LCEL pipeline for job: {job_id}")
+    
+    # Define LangChain LCEL Pipeline
+    langchain_pipeline = (
+        RunnableLambda(load_data_step)
+        | RunnableLambda(clean_step)
+        | RunnableLambda(classify_step)
+        | RunnableLambda(cluster_step)
+        | RunnableLambda(score_step)
+        | RunnableLambda(generate_ideas_step)
+        | RunnableLambda(critique_step)
+        | RunnableLambda(scriptwriter_step)
+        | RunnableLambda(visuals_step)
+        | RunnableLambda(gap_analysis_step)
+        | RunnableLambda(draft_replies_step)
+    )
+    
+    initial_state = {
+        "job_id": job_id,
+        "raw_comments_data": [],
+        "cleaned_comments": [],
+        "removed_comments": [],
+        "classified_comments": [],
+        "cluster_summaries": [],
+        "scored_clusters": [],
+        "generated_ideas": [],
+        "analyzed_ideas": [],
+        "reply_drafts": [],
+        "stats": {},
+        "error": ""
+    }
+    
+    try:
+        # Run the LCEL chain
+        final_state = langchain_pipeline.invoke(initial_state)
+        
+        if final_state.get("error"):
+            # Update failed job
+            error_msg = final_state["error"]
+            logger.error(f"Pipeline failed for job {job_id} with error: {error_msg}")
+            update_job_status(job_id, "failed", 0, "Execution error", error_message=error_msg)
+        else:
+            # Update successful job
+            stats = final_state["stats"]
+            update_job_status(job_id, "completed", 100, "Pipeline completed successfully", stats=stats)
+            logger.info(f"ComIdea LangChain pipeline completed for job {job_id} with {stats['ideas_count']} ideas.")
+            
     except Exception as e:
         logger.exception(f"Pipeline failed for job {job_id}: {e}")
         update_job_status(job_id, "failed", 0, "Execution error", error_message=str(e))
-    finally:
-        db.close()
