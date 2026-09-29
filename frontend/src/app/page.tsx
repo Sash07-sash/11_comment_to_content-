@@ -45,7 +45,7 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(true);
 
   // View mode: 'grid' or 'list' for concise scanning
-  const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
+  const [viewMode, setViewMode] = useState<'grid' | 'list'>('list');
 
   // Filter & Search states
   const [searchQuery, setSearchQuery] = useState('');
